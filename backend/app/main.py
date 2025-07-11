@@ -18,4 +18,10 @@ def read_root():
 
 @app.get("/saju")
 def read_saju():
-    return saju.get_ipchun_datetime(1995)
+    result = {
+        "day": saju.days_calc(1995, 1, 19),
+        "month": saju.months_calc(1995, 1, 19, 4, 44),
+        "year": saju.years_calc(1995, 1, 19, 4, 44),
+        "time": saju.times_calc(1995, 1, 19, 4, 44)
+    }
+    return result
