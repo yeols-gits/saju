@@ -2,6 +2,7 @@ import datetime
 from pathlib import Path
 from skyfield.api import load
 from skyfield import almanac
+import numpy as np
 
 
 gan_list = ['갑', '을', '병', '정', '무', '기', '경', '신', '임', '계']
@@ -10,7 +11,13 @@ month_ji_list = ['인', '묘', '진', '사', '오', '미', '신', '유', '술', 
 
 
 def get_baseDay():
-    return datetime.datetime(1900, 1, 1)
+    return datetime.datetime(1900, 1, 1, 0, 0, 0)
+
+# 황경 계산 함수
+def sun_longtitude_degrees(t, sun, earth):
+    astrometric = earth.at(t).observe(sun).apparent()
+    ecliptic = astrometric.ecliptic_latlon()
+    return ecliptic[1].degrees % 360
 
 # 시주계산
 def times_calc(year, month, day, hour, min):
@@ -73,30 +80,45 @@ def days_calc(year, month, day):
 def get_solar_term_datetimes(year):
     ts = load.timescale()
     data_path = Path(__file__).parent.parent / 'data' / 'de442.bsp'
-    eph = load(data_path)
-    
+    eph = load(str(data_path))
+
+
     # 12 절기 (월의 시작) longitudes, 입춘부터 순서대로
     longitudes = [315, 345, 15, 45, 75, 105, 135, 165, 195, 225, 255, 285]
+    longitudes_wrapped = sorted(sorted((deg + 360) % 360 for deg in longitudes)+[360])
     
     # 검색 범위를 해당 년도 1월 1일 ~ 다음해 1월 31일로 넉넉하게 잡는다
     t0 = ts.utc(year, 1, 1)
     t1 = ts.utc(year + 1, 1, 31)
 
-    t, y = almanac.find_discrete(t0, t1, almanac.solar_longitude(eph), longitudes)
-    
-    term_map = {lon: dt.utc_datetime() for lon, dt in zip(y, t)}
-    
-    # longitudes 순서대로 datetime 객체 리스트를 만들어 반환
-    sorted_datetimes = [term_map[lon] for lon in longitudes]
-    return sorted_datetimes
+    def compute(t):
+        sun = eph['sun']
+        earth = eph['earth']
+        astrometric = earth.at(t).observe(sun).apparent()
+        lon_deg = astrometric.ecliptic_latlon()[1].degrees % 360
+
+        # 구간별 정수 라벨 반환
+        categories = np.digitize(lon_deg, longitudes_wrapped, right=False)
+        return categories
+
+    compute.step_days = 0.25
+
+    t0 = ts.utc(year, 1, 1)
+    t1 = ts.utc(year + 1, 1, 31)
+    t, y = almanac.find_discrete(t0, t1, compute)
+
+    angle_map = {i: longitudes_wrapped[i] for i in range(len(longitudes_wrapped))}
+    term_map = {angle_map[i]: time.utc_datetime() for i, time in zip(y, t)}
+
+    return [term_map[deg] for deg in longitudes_wrapped]
 
 # 월주계산
 def months_calc(year, month, day, hour, min):
-    birth_dt = datetime.datetime(year, month, day, hour, min)
-    
+    birth_utc = datetime.datetime(year, month, day, hour, min, tzinfo=datetime.timezone.utc)
+
     # 1. 기준 년도(saju_year) 정하기
     ipchun_this_year = get_ipchun_datetime(year)
-    saju_year = year if birth_dt >= ipchun_this_year else year - 1
+    saju_year = year if birth_utc >= ipchun_this_year else year - 1
 
     # 2. 기준 년도의 12절기 및 다음해 입춘 시간 구하기
     saju_year_terms = get_solar_term_datetimes(saju_year)
@@ -107,7 +129,7 @@ def months_calc(year, month, day, hour, min):
     for i in range(12):
         start_term = saju_year_terms[i]
         end_term = saju_year_terms[i+1] if i < 11 else next_year_ipchun
-        if start_term <= birth_dt < end_term:
+        if start_term <= birth_utc < end_term:
             ji_idx = i
             break
     
@@ -128,7 +150,7 @@ def months_calc(year, month, day, hour, min):
 # 년주계산
 def years_calc(year, month, day, hour, min):
     ipchun_dt = get_ipchun_datetime(year)
-    birth_dt = datetime.datetime(year, month, day, hour, min)
+    birth_dt = datetime.datetime(year, month, day, hour, min, tzinfo=datetime.timezone.utc)
 
     saju_year = year
     if birth_dt < ipchun_dt:
@@ -142,29 +164,24 @@ def years_calc(year, month, day, hour, min):
 def get_ipchun_datetime(year):
     ts = load.timescale()
     data_path = Path(__file__).parent.parent / 'data' / 'de442.bsp'
-    eph = load(data_path)
+    eph = load(str(data_path))
     sun = eph['sun']
     earth = eph['earth']
 
     # 입춘은 매년 2월 3~5일 사이 → 이 범위에서 태양 황경 315°를 찾는다
     t0 = ts.utc(year, 2, 3)
     t1 = ts.utc(year, 2, 5)
-
-    def sun_longtitude_degrees(t):
-        astrometric = earth.at(t).observe(sun).apparent()
-        ecliptic = astrometric.ecliptic_latlon()
-        return ecliptic[1].degrees % 360
     
     check_time = t0
     while check_time < t1:
-        if sun_longtitude_degrees(check_time) >= 315:
+        if sun_longtitude_degrees(check_time, sun, earth) >= 315:
             break
         check_time = ts.utc(check_time.utc_datetime() + datetime.timedelta(minutes=30))
 
     # 2차: 해당 근처에서 1분 단위로 정밀 탐색
     for i in range(31):
         finer = ts.utc(check_time.utc_datetime() - datetime.timedelta(minutes=i))
-        if sun_longtitude_degrees(finer) < 315:
-            return ts.utc(finer.utc_datetime() + datetime.timedelta(minutes=1)).utc_datetime()
+        if sun_longtitude_degrees(finer, sun, earth) < 315:
+            return finer.utc_datetime() + datetime.timedelta(minutes=1)
 
     raise ValueError(f"{year}년의 입춘 시각을 찾을수 없습니다.")
